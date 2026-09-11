@@ -1,156 +1,119 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import math
 
 
-class ChannelAttention(nn.Module):
-    def __init__(self, channels, reduction=4):
+class CAB(nn.Module):
+    """Channel Attention Block (Fig. 2 of paper).
+
+    Uses shared Conv1d(1x1) MLP on both avg-pooled and max-pooled features,
+    adds both attention maps, then applies residual connection.
+    M_CAB = [σ(F_{1xC}(δ(F_{1xC/2}(AvgPool(M)))) + σ(F_{1xC}(δ(F_{1xC/2}(MaxPool(M)))))] · M + M
+    """
+
+    def __init__(self, C):
         super().__init__()
         self.avg_pool = nn.AdaptiveAvgPool1d(1)
         self.max_pool = nn.AdaptiveMaxPool1d(1)
-        self.fc = nn.Sequential(
-            nn.Linear(channels, channels // reduction, bias=False),
+        self.shared_mlp = nn.Sequential(
+            nn.Conv1d(C, C // 2, 1),
             nn.ReLU(inplace=True),
-            nn.Linear(channels // reduction, channels, bias=False),
+            nn.Conv1d(C // 2, C, 1),
+            nn.Sigmoid(),
         )
+
+    def forward(self, M):
+        avg_out = self.shared_mlp(self.avg_pool(M))
+        max_out = self.shared_mlp(self.max_pool(M))
+        attn = avg_out + max_out
+        return attn * M + M
+
+
+class SAB(nn.Module):
+    """Spatial Attention Block (Fig. 3 of paper).
+
+    Uses a single Conv1d(C, 1, kernel_size=1) + Sigmoid to produce a
+    1-D spatial weight map, then applies residual connection.
+    M_SAB = σ(F_{1x1}(M)) · M + M
+    """
+
+    def __init__(self, C):
+        super().__init__()
+        self.conv = nn.Conv1d(C, 1, 1, bias=False)
         self.sigmoid = nn.Sigmoid()
 
-    def forward(self, x):
-        b, c, _ = x.size()
-        avg_out = self.fc(self.avg_pool(x).view(b, c))
-        max_out = self.fc(self.max_pool(x).view(b, c))
-        attn = self.sigmoid(avg_out + max_out).unsqueeze(-1)
-        return x * attn
+    def forward(self, M):
+        attn = self.sigmoid(self.conv(M))
+        return attn * M + M
 
 
-class SpatialAttention(nn.Module):
-    def __init__(self, kernel_size=7):
+class MAB(nn.Module):
+    """Multi-Attention Block (Fig. 4a of paper).
+
+    CAB and SAB connected in series: Input → CAB → SAB → Output.
+    """
+
+    def __init__(self, C):
         super().__init__()
-        self.conv = nn.Conv1d(2, 1, kernel_size, padding=kernel_size // 2, bias=False)
-        self.sigmoid = nn.Sigmoid()
+        self.cab = CAB(C)
+        self.sab = SAB(C)
 
-    def forward(self, x):
-        avg_out = torch.mean(x, dim=1, keepdim=True)
-        max_out, _ = torch.max(x, dim=1, keepdim=True)
-        combined = torch.cat([avg_out, max_out], dim=1)
-        attn = self.sigmoid(self.conv(combined))
-        return x * attn
-
-
-class MultiAttentionBlock(nn.Module):
-    def __init__(self, channels, seq_len, reduction=4):
-        super().__init__()
-        self.channel_attn = ChannelAttention(channels, reduction)
-        self.spatial_attn = SpatialAttention(kernel_size=7)
-        self.norm = nn.LayerNorm([channels])
-        self.ffn = nn.Sequential(
-            nn.Conv1d(channels, channels * 4, 1),
-            nn.GELU(),
-            nn.Conv1d(channels * 4, channels, 1),
-        )
-        self.norm2 = nn.LayerNorm([channels])
-
-    def forward(self, x):
-        residual = x
-        x = self.channel_attn(x)
-        x = self.spatial_attn(x)
-        x = self.norm((x + residual).permute(0, 2, 1)).permute(0, 2, 1)
-
-        residual = x
-        x = self.ffn(x)
-        x = self.norm2((x + residual).permute(0, 2, 1)).permute(0, 2, 1)
-        return x
-
-
-class ConvBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, padding=1):
-        super().__init__()
-        self.conv = nn.Conv1d(in_channels, out_channels, kernel_size, stride, padding)
-        self.bn = nn.BatchNorm1d(out_channels)
-        self.relu = nn.ReLU(inplace=True)
-
-    def forward(self, x):
-        return self.relu(self.bn(self.conv(x)))
-
-
-class ResBlock(nn.Module):
-    def __init__(self, channels):
-        super().__init__()
-        self.conv1 = nn.Conv1d(channels, channels, 3, padding=1)
-        self.bn1 = nn.BatchNorm1d(channels)
-        self.conv2 = nn.Conv1d(channels, channels, 3, padding=1)
-        self.bn2 = nn.BatchNorm1d(channels)
-        self.relu = nn.ReLU(inplace=True)
-
-    def forward(self, x):
-        residual = x
-        out = self.relu(self.bn1(self.conv1(x)))
-        out = self.bn2(self.conv2(out))
-        return self.relu(out + residual)
+    def forward(self, M):
+        return self.sab(self.cab(M))
 
 
 class Attention1DCNN(nn.Module):
-    def __init__(self, input_length=64, channels=None):
+    """1DCNN-MAM architecture from paper (Fig. 4b, Table I).
+
+    Sequential structure:
+      Input(2, K)
+      → Conv1d(2→C, k=3) + LeakyReLU
+      → MAB-1 → Conv1d(C→C, k=3) + LeakyReLU
+      → MAB-2 → Conv1d(C→C, k=3) + LeakyReLU
+      → MAB-3 → Conv1d(C→C, k=3) + LeakyReLU
+      → MAB-4 → Conv1d(C→2, k=3) + LeakyReLU
+      Output(2, K)
+
+    `num_mab` controls the number of MAB blocks (Fig. 5 ablation). For the
+    default num_mab=4 the sub-module names match the transfer-learning part
+    split exactly (mab1..mab4, conv1..conv3); for other depths the loop
+    enumerates mab1..mabN / conv1..conv(N-1) with the same naming scheme.
+
+    Operates on frequency-domain OFDM symbols split into real/imag channels.
+    """
+
+    def __init__(self, input_length=64, channels=None, dropout=0.1, num_mab=4):
         super().__init__()
         if channels is None:
-            channels = [32, 64, 128]
+            channels = 64
+        C = channels
+        self.C = C
+        self.num_mab = num_mab
 
-        self.input_length = input_length
-        self.encoder_channels = channels
-        self.decoder_channels = list(reversed(channels))
+        self.conv_in = nn.Conv1d(2, C, 3, padding=1)
+        for i in range(1, num_mab + 1):
+            setattr(self, f"mab{i}", MAB(C))
+            if i < num_mab:
+                setattr(self, f"conv{i}", nn.Conv1d(C, C, 3, padding=1))
+        self.conv_out = nn.Conv1d(C, 2, 3, padding=1)
 
-        self.encoder_convs = nn.ModuleList()
-        self.encoder_attns = nn.ModuleList()
-        self.downsample = nn.ModuleList()
-
-        in_ch = 2
-        current_len = input_length
-        for out_ch in channels:
-            self.encoder_convs.append(ConvBlock(in_ch, out_ch, kernel_size=7, padding=3))
-            self.encoder_attns.append(MultiAttentionBlock(out_ch, current_len))
-            self.downsample.append(nn.Conv1d(out_ch, out_ch, 4, stride=2, padding=1))
-            in_ch = out_ch
-            current_len = current_len // 2
-
-        self.bottleneck = nn.Sequential(
-            ResBlock(channels[-1]),
-            ResBlock(channels[-1]),
-        )
-
-        self.decoder_convs = nn.ModuleList()
-        self.decoder_attns = nn.ModuleList()
-        self.upsample = nn.ModuleList()
-
-        in_ch = channels[-1]
-        current_len = input_length // (2 ** len(channels))
-        for i, out_ch in enumerate(self.decoder_channels):
-            self.upsample.append(nn.ConvTranspose1d(in_ch, out_ch, 4, stride=2, padding=1))
-            self.decoder_convs.append(ConvBlock(out_ch * 2, out_ch, kernel_size=5, padding=2))
-            self.decoder_attns.append(MultiAttentionBlock(out_ch, current_len * (2 ** (i + 1))))
-            in_ch = out_ch
-
-        self.output_conv = nn.Sequential(
-            nn.Conv1d(channels[0], 16, 3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv1d(16, 2, 1),
-        )
-
+        self.lrelu = nn.LeakyReLU(inplace=True)
         self._initialize_weights()
 
     def _initialize_weights(self):
         for m in self.modules():
-            if isinstance(m, nn.Conv1d) or isinstance(m, nn.ConvTranspose1d):
-                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
+            if isinstance(m, nn.Conv1d):
+                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="leaky_relu")
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
-            elif isinstance(m, nn.BatchNorm1d):
-                nn.init.constant_(m.weight, 1)
-                nn.init.constant_(m.bias, 0)
-            elif isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight)
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
+
+        # Zero-init the output projection so the network starts at zero output.
+        # This avoids huge initial FFT/null-loss magnitude and guarantees the
+        # loss landscape is well-conditioned at epoch 0 (pure denoising task).
+        if isinstance(self.conv_out, nn.Conv1d):
+            nn.init.zeros_(self.conv_out.weight)
+            if self.conv_out.bias is not None:
+                nn.init.zeros_(self.conv_out.bias)
 
     def forward(self, x):
         if x.dim() == 2:
@@ -158,31 +121,18 @@ class Attention1DCNN(nn.Module):
         if x.dim() == 3 and x.shape[1] == 1:
             x = torch.cat([x.real, x.imag], dim=1)
 
-        skip_connections = []
-        for conv, attn, down in zip(self.encoder_convs, self.encoder_attns, self.downsample):
-            x = conv(x)
-            x = attn(x)
-            skip_connections.append(x)
-            x = down(x)
-
-        x = self.bottleneck(x)
-
-        for i, (up, conv, attn) in enumerate(
-            zip(self.upsample, self.decoder_convs, self.decoder_attns)
-        ):
-            x = up(x)
-            skip = skip_connections[-(i + 1)]
-            if x.shape[-1] != skip.shape[-1]:
-                x = x[:, :, : skip.shape[-1]]
-            x = torch.cat([x, skip], dim=1)
-            x = conv(x)
-            x = attn(x)
-
-        x = self.output_conv(x)
+        x = self.lrelu(self.conv_in(x))
+        for i in range(1, self.num_mab + 1):
+            x = getattr(self, f"mab{i}")(x)
+            if i < self.num_mab:
+                x = self.lrelu(getattr(self, f"conv{i}")(x))
+        x = self.lrelu(self.conv_out(x))
         return x
 
 
 class ImpulsiveNoiseDetector(nn.Module):
+    """Separate lightweight detector for impulsive noise locations (not used in main pipeline)."""
+
     def __init__(self, input_length=128):
         super().__init__()
 
@@ -197,9 +147,6 @@ class ImpulsiveNoiseDetector(nn.Module):
             nn.BatchNorm1d(128),
             nn.ReLU(inplace=True),
         )
-
-        self.channel_attn = ChannelAttention(128, reduction=4)
-        self.spatial_attn = SpatialAttention(kernel_size=5)
 
         self.decoder = nn.Sequential(
             nn.Conv1d(128, 64, 3, padding=1),
@@ -217,9 +164,6 @@ class ImpulsiveNoiseDetector(nn.Module):
             x = torch.stack([x.real, x.imag], dim=1)
         elif x.shape[1] == 1:
             x = torch.cat([x.real, x.imag], dim=1)
-
         features = self.encoder(x)
-        features = self.channel_attn(features)
-        features = self.spatial_attn(features)
         mask = self.decoder(features)
         return mask.squeeze(1)

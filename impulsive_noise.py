@@ -104,6 +104,44 @@ class ImpulsiveNoiseGenerator:
 
         return signal + awgn + impulsive
 
+    def add_gm_noise(self, signal, snr_db=20, sir_db=-15, p=0.02):
+        """Two-component Gaussian Mixture composite noise (paper Section 2.2).
+
+        u[n] ~ (1-p) N(0, sigma_w^2) + p N(0, sigma_w^2 + sigma_i^2)
+
+        where sigma_w^2 is the ambient noise variance (from SNR), and the
+        impulsive component, present with probability p, has extra variance
+        sigma_i^2 = sigma_w^2 * 10^(-sir_db / 10) (from SIR).
+
+        Noise is added in the TIME domain so the impulsive spikes are sparse
+        in time, exactly as in the paper's received signal model y[n] =
+        r[n] + w[n] + i[n].
+        """
+        sigma_w2 = np.mean(np.abs(signal) ** 2) / (10 ** (snr_db / 10))
+        sigma_i2 = sigma_w2 * (10 ** (-sir_db / 10))
+
+        if signal.ndim == 1:
+            signal = signal.reshape(1, -1)
+
+        out = np.zeros_like(signal)
+        for i in range(signal.shape[0]):
+            K = signal.shape[1]
+            awgn = np.sqrt(sigma_w2 / 2) * (
+                np.random.randn(K) + 1j * np.random.randn(K)
+            )
+            mask = np.random.random(K) < p
+            n_in = int(mask.sum())
+            impulsive = np.zeros(K, dtype=complex)
+            if n_in > 0:
+                impulsive[mask] = np.sqrt(sigma_i2 / 2) * (
+                    np.random.randn(n_in) + 1j * np.random.randn(n_in)
+                )
+            out[i] = signal[i] + awgn + impulsive
+
+        if out.shape[0] == 1:
+            return out[0]
+        return out
+
     def estimate_impulsive_power(self, signal, threshold_factor=3):
         magnitude = np.abs(signal)
         median_mag = np.median(magnitude)

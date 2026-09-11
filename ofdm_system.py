@@ -8,6 +8,18 @@ class OFDMSystem:
         self.modulation = modulation
         self.bits_per_symbol = 2 if modulation == "QPSK" else 4
 
+        n_null = max(2, n_subcarriers // 16)
+        self.null_subcarriers = np.array(
+            list(range(n_null // 2)) + list(range(n_subcarriers - n_null + n_null // 2, n_subcarriers)),
+            dtype=int,
+        )
+        self.data_subcarriers = np.array(
+            [i for i in range(n_subcarriers) if i not in self.null_subcarriers],
+            dtype=int,
+        )
+        self.null_mask = np.zeros(n_subcarriers, dtype=bool)
+        self.null_mask[self.null_subcarriers] = True
+
     def generate_random_bits(self, n_symbols):
         return np.random.randint(
             0, 2, size=(n_symbols, self.n_subcarriers * self.bits_per_symbol)
@@ -23,7 +35,9 @@ class OFDMSystem:
                 [1 + 1j, 1 - 1j, -1 + 1j, -1 - 1j]
             ) / np.sqrt(2)
             indices = bit_groups[:, :, 0] * 2 + bit_groups[:, :, 1]
-            return constellation[indices]
+            symbols = constellation[indices]
+            symbols[:, self.null_subcarriers] = 0
+            return symbols
         elif self.modulation == "16QAM":
             constellation = np.array([
                 -3-3j, -3-1j, -3+1j, -3+3j,
@@ -33,7 +47,9 @@ class OFDMSystem:
             ]) / np.sqrt(10)
             indices = (bit_groups[:, :, 0] * 8 + bit_groups[:, :, 1] * 4 +
                        bit_groups[:, :, 2] * 2 + bit_groups[:, :, 3])
-            return constellation[indices]
+            symbols = constellation[indices]
+            symbols[:, self.null_subcarriers] = 0
+            return symbols
 
     def demodulate(self, received_symbols):
         if self.modulation == "QPSK":
